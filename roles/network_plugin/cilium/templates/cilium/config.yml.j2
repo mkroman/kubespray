@@ -71,7 +71,7 @@ data:
 
 {% if cilium_version | regex_replace('v') is version('1.14.0', '>=') %}
   # Tell the agent to generate and write a CNI configuration file
-  write-cni-conf-when-ready: /etc/cni/net.d/05-cilium.conflist
+  write-cni-conf-when-ready: /host/etc/cni/net.d/05-cilium.conflist
   cni-exclusive: "{{ cilium_cni_exclusive }}"
   cni-log-file: "{{ cilium_cni_log_file }}"
 {% endif %}
@@ -94,6 +94,8 @@ data:
   # during the upgrade process, comment out these options.
   bpf-ct-global-tcp-max: "524288"
   bpf-ct-global-any-max: "262144"
+
+  procfs: /host/proc
 
   # Pre-allocation of map entries allows per-packet latency to be reduced, at
   # the expense of up-front memory allocation for the entries in the maps. The

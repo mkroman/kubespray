@@ -18,14 +18,18 @@ spec:
   template:
     metadata:
       annotations:
+        container.apparmor.security.beta.kubernetes.io/apply-sysctl-overwrites: unconfined
+        container.apparmor.security.beta.kubernetes.io/cilium-agent: unconfined
+        container.apparmor.security.beta.kubernetes.io/clean-cilium-state: unconfined
+        container.apparmor.security.beta.kubernetes.io/mount-cgroup: unconfined
 {% if cilium_enable_prometheus %}
         prometheus.io/port: "{{ cilium_agent_scrape_port }}"
         prometheus.io/scrape: "true"
 {% endif %}
-        scheduler.alpha.kubernetes.io/tolerations: '[{"key":"dedicated","operator":"Equal","value":"master","effect":"NoSchedule"}]'
       labels:
         k8s-app: cilium
     spec:
+      automountServiceAccountToken: true
       containers:
       - name: cilium-agent
         image: "{{ cilium_image_repo }}:{{ cilium_image_tag }}"
@@ -96,6 +100,11 @@ spec:
               fieldPath: metadata.namespace
         - name: CILIUM_CLUSTERMESH_CONFIG
           value: /var/lib/cilium/clustermesh/
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              divisor: '1'
+              resource: limits.memory
 {% if cilium_kube_proxy_replacement == 'strict' %}
         - name: KUBERNETES_SERVICE_HOST
           value: "{{ kube_apiserver_global_endpoint | urlsplit('hostname') }}"
@@ -106,17 +115,32 @@ spec:
         - {{ env_var | to_nice_yaml(indent=2) | indent(10) }}
 {% endfor %}
         lifecycle:
-{% if cilium_version | regex_replace('v') is version('1.14', '<') %}
           postStart:
             exec:
               command:
-              - "/cni-install.sh"
-              - "--cni-exclusive={{ cilium_cni_exclusive | string | lower }}"
-{% if cilium_version | regex_replace('v') is version('1.12', '>=') %}
-              - "--enable-debug={{ cilium_debug | string | lower }}"
-              - "--log-file={{ cilium_cni_log_file }}"
-{% endif %}
-{% endif %}
+              - "bash"
+              - "-c"
+              - |
+                    set -o errexit
+                    set -o pipefail
+                    set -o nounset
+
+                    # When running in AWS ENI mode, it's likely that 'aws-node' has
+                    # had a chance to install SNAT iptables rules. These can result
+                    # in dropped traffic, so we should attempt to remove them.
+                    # We do it using a 'postStart' hook since this may need to run
+                    # for nodes which might have already been init'ed but may still
+                    # have dangling rules. This is safe because there are no
+                    # dependencies on anything that is part of the startup script
+                    # itself, and can be safely run multiple times per node (e.g. in
+                    # case of a restart).
+                    if [[ "$(iptables-save | grep -E -c 'AWS-SNAT-CHAIN|AWS-CONNMARK-CHAIN')" != "0" ]];
+                    then
+                        echo 'Deleting iptables rules created by the AWS CNI VPC plugin'
+                        iptables-save | grep -E -v 'AWS-SNAT-CHAIN|AWS-CONNMARK-CHAIN' | iptables-restore
+                    fi
+                    echo 'Done!'
+
           preStop:
             exec:
               command:
@@ -144,11 +168,37 @@ spec:
           protocol: TCP
 {% endif %}
         securityContext:
-          privileged: true
+          seLinuxOptions:
+            level: s0
+            type: spc_t
+          capabilities:
+            add:
+              - CHOWN
+              - KILL
+              - NET_ADMIN
+              - NET_RAW
+              - IPC_LOCK
+              - SYS_MODULE
+              - SYS_ADMIN
+              - SYS_RESOURCE
+              - DAC_OVERRIDE
+              - FOWNER
+              - SETGID
+              - SETUID
+            drop:
+              - ALL
         volumeMounts:
+        # Unprivileged containers need to mount /proc/sys/net from the host
+        # to have write access
+        - mountPath: /host/proc/sys/net
+          name: host-proc-sys-net
+        # Unprivileged containers need to mount /proc/sys/kernel from the host
+        # to have write access
+        - mountPath: /host/proc/sys/kernel
+          name: host-proc-sys-kernel
         - name: bpf-maps
           mountPath: /sys/fs/bpf
-          mountPropagation: Bidirectional
+          mountPropagation: HostToContainer
         - name: cilium-run
           mountPath: /var/run/cilium
 {% if cilium_version | regex_replace('v') is version('1.13.1', '<') %}
@@ -192,6 +242,8 @@ spec:
           mountPath: /var/lib/cilium/tls/hubble
           readOnly: true
 {% endif %}
+        - name: tmp
+          mountPath: /tmp
 {% for volume_mount in cilium_agent_extra_volume_mounts %}
         - {{ volume_mount | to_nice_yaml(indent=2) | indent(10) }}
 {% endfor %}
@@ -201,6 +253,27 @@ spec:
 {% endif %}
       hostNetwork: true
       initContainers:
+      - name: config
+        image: "{{ cilium_image_repo }}:{{ cilium_image_tag }}"
+        imagePullPolicy: {{ k8s_image_pull_policy }}
+        command:
+        - cilium-dbg
+        - build-config
+        env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: CILIUM_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        terminationMessagePolicy: FallbackToLogsOnError
 {% if cilium_version | regex_replace('v') is version('1.11', '>=') and cilium_cgroup_auto_mount %}
       - name: mount-cgroup
         image: "{{ cilium_image_repo }}:{{ cilium_image_tag }}"
@@ -228,7 +301,16 @@ spec:
         - name: cni-path
           mountPath: /hostbin
         securityContext:
-          privileged: true
+          seLinuxOptions:
+            level: s0
+            type: spc_t
+          capabilities:
+            add:
+              - SYS_ADMIN
+              - SYS_CHROOT
+              - SYS_PTRACE
+            drop:
+              - ALL
 {% endif %}
 {% if cilium_version | regex_replace('v') is version('1.11.7', '>=') %}
       - name: apply-sysctl-overwrites
@@ -254,9 +336,38 @@ spec:
           mountPath: /hostproc
         - name: cni-path
           mountPath: /hostbin
+        terminationMessagePolicy: FallbackToLogsOnError
+        securityContext:
+          seLinuxOptions:
+            level: s0
+            type: spc_t
+          capabilities:
+            add:
+              - SYS_ADMIN
+              - SYS_CHROOT
+              - SYS_PTRACE
+            drop:
+              - ALL
+{% endif %}
+      # Mount the bpf fs if it is not mounted. We will perform this task
+      # from a privileged container because the mount propagation bidirectional
+      # only works from privileged containers.
+      - name: mount-bpf-fs
+        image: "{{ cilium_image_repo }}:{{ cilium_image_tag }}"
+        imagePullPolicy: {{ k8s_image_pull_policy }}
+        args:
+        - 'mount | grep "/sys/fs/bpf type bpf" || mount -t bpf bpf /sys/fs/bpf'
+        command:
+        - /bin/bash
+        - -c
+        - --
+        terminationMessagePolicy: FallbackToLogsOnError
         securityContext:
           privileged: true
-{% endif %}
+        volumeMounts:
+        - name: bpf-maps
+          mountPath: /sys/fs/bpf
+          mountPropagation: Bidirectional
       - name: clean-cilium-state
         image: "{{ cilium_image_repo }}:{{ cilium_image_tag }}"
         imagePullPolicy: {{ k8s_image_pull_policy }}
@@ -275,6 +386,12 @@ spec:
               name: cilium-config
               key: clean-cilium-bpf-state
               optional: true
+        - name: WRITE_CNI_CONF_WHEN_READY
+          valueFrom:
+            configMapKeyRef:
+              name: cilium-config
+              key: write-cni-conf-when-ready
+              optional: true
 # Removed in 1.11 and up.
 # https://github.com/cilium/cilium/commit/f7a3f59fd74983c600bfce9cac364b76d20849d9
 {% if cilium_version | regex_replace('v') is version('1.11', '<') %}
@@ -291,8 +408,19 @@ spec:
         - name: KUBERNETES_SERVICE_PORT
           value: "{{ kube_apiserver_global_endpoint | urlsplit('port') }}"
 {% endif %}
+        terminationMessagePolicy: FallbackToLogsOnError
         securityContext:
-          privileged: true
+          seLinuxOptions:
+            level: s0
+            type: spc_t
+          capabilities:
+            add:
+              - NET_ADMIN
+              - SYS_MODULE
+              - SYS_ADMIN
+              - SYS_RESOURCE
+            drop:
+              - ALL
         volumeMounts:
         - name: bpf-maps
           mountPath: /sys/fs/bpf
@@ -320,7 +448,12 @@ spec:
             cpu: 100m
             memory: 10Mi
         securityContext:
-          privileged: true
+          seLinuxOptions:
+            level: s0
+            type: spc_t
+          capabilities:
+            drop:
+              - ALL
         terminationMessagePolicy: FallbackToLogsOnError
         volumeMounts:
           - name: cni-path
@@ -331,11 +464,6 @@ spec:
       serviceAccount: cilium
       serviceAccountName: cilium
       terminationGracePeriodSeconds: 1
-      hostNetwork: true
-# In managed etcd mode, Cilium must be able to resolve the DNS name of the etcd service
-{% if cilium_identity_allocation_mode == "kvstore" %}
-      dnsPolicy: ClusterFirstWithHostNet
-{% endif %}
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -346,6 +474,9 @@ spec:
       tolerations:
       - operator: Exists
       volumes:
+        # For sharing configuration between the "config" initContainer and the agent
+      - name: tmp
+        emptyDir: {}
         # To keep state between restarts / upgrades
       - name: cilium-run
         hostPath:
@@ -404,12 +535,35 @@ spec:
 {% endif %}
         # To read the clustermesh configuration
       - name: clustermesh-secrets
-        secret:
-          secretName: cilium-clustermesh
+        projected:
           # note: the leading zero means this number is in octal representation: do not remove it
           defaultMode: 0400
-          optional: true
-        # To read the configuration from the config map
+          sources:
+          - secret:
+              name: cilium-clustermesh
+              optional: true
+              # note: items are not explicitly listed here, since the entries of this secret
+              # depend on the peers configured, and that would cause a restart of all agents
+              # at every addition/removal. Leaving the field empty makes each secret entry
+              # to be automatically projected into the volume as a file whose name is the key.
+          - secret:
+              name: clustermesh-apiserver-remote-cert
+              optional: true
+              items:
+              - key: tls.key
+                path: common-etcd-client.key
+              - key: tls.crt
+                path: common-etcd-client.crt
+              - key: ca.crt
+                path: common-etcd-client-ca.crt
+      - name: host-proc-sys-net
+        hostPath:
+          path: /proc/sys/net
+          type: Directory
+      - name: host-proc-sys-kernel
+        hostPath:
+          path: /proc/sys/kernel
+          type: Directory
       - name: cilium-config-path
         configMap:
           name: cilium-config

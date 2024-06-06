@@ -7,10 +7,10 @@
     owner: "{{ kube_owner }}"
     recurse: true
 
-- name: CNI | Copy cni plugins
-  unarchive:
-    src: "{{ downloads.cni.dest }}"
-    dest: "/opt/cni/bin"
-    mode: 0755
-    owner: "{{ kube_owner }}"
-    remote_src: yes
+# - name: CNI | Copy cni plugins
+#   unarchive:
+#     src: "{{ downloads.cni.dest }}"
+#     dest: "/opt/cni/bin"
+#     mode: 0755
+#     owner: "{{ kube_owner }}"
+#     remote_src: yes
