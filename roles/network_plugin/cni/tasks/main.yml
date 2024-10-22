@@ -3,7 +3,7 @@
   file:
     path: /opt/cni/bin
     state: directory
-    mode: 0755
+    mode: "0755"
     owner: "{{ cni_bin_owner }}"
     recurse: true
 
